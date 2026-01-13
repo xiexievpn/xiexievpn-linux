@@ -61,7 +61,12 @@
       "optional_update_msg": "发现新版本，是否立即更新？",
       "updating": "正在更新...",
       "download_failed": "下载失败",
-      "version_label": "版本"
+      "version_label": "版本",
+      "env_check_title": "环境检查失败",
+      "env_notice_title": "环境提示",
+      "err_no_display": "未检测到图形显示环境 (DISPLAY 未设置)。\n请在桌面环境中运行此程序，而非 SSH/TTY。",
+      "warn_no_dbus": "未检测到 DBus 会话总线。\n系统代理设置可能无法自动生效。\nVPN 仍可使用，请手动配置浏览器代理:\n  HTTP: 127.0.0.1:1080\n  SOCKS5: 127.0.0.1:10809",
+      "warn_non_gnome": "检测到桌面环境: {desktop}\n此程序使用 GNOME 系统代理设置。\n在非 GNOME 环境中，浏览器可能不会自动使用代理。\n您可能需要手动配置浏览器代理为:\n  HTTP: 127.0.0.1:1080\n  SOCKS5: 127.0.0.1:10809"
     }
   },
   "en": {
@@ -126,7 +131,12 @@
       "optional_update_msg": "A new version is available. Update now?",
       "updating": "Updating...",
       "download_failed": "Download failed",
-      "version_label": "Version"
+      "version_label": "Version",
+      "env_check_title": "Environment Check Failed",
+      "env_notice_title": "Environment Notice",
+      "err_no_display": "No graphical display detected (DISPLAY not set).\nPlease run this program in a desktop environment, not SSH/TTY.",
+      "warn_no_dbus": "DBus session bus not detected.\nSystem proxy settings may not be applied automatically.\nVPN will still work. Please configure browser proxy manually:\n  HTTP: 127.0.0.1:1080\n  SOCKS5: 127.0.0.1:10809",
+      "warn_non_gnome": "Detected desktop: {desktop}\nThis program uses GNOME system proxy settings (gsettings).\nIn non-GNOME environments, browsers may not automatically use the proxy.\nYou may need to manually configure browser proxy to:\n  HTTP: 127.0.0.1:1080\n  SOCKS5: 127.0.0.1:10809"
     }
   }
 }
