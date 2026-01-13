@@ -145,6 +145,7 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = CONFIG_DIR / "config.json"
 UUID_FILE = CONFIG_DIR / "uuid.txt"
 AUTOSTART_FILE = CONFIG_DIR / "autostart_state.txt"
+AUTO_LOGIN_FILE = CONFIG_DIR / "auto_login.txt"  # 标记是否自动登录
 XRAY_BIN = CONFIG_DIR / "xray"
 
 # 区域代码映射
@@ -224,28 +225,16 @@ def check_environment():
     # 1. 检查 DISPLAY 环境变量（图形会话）
     display = os.environ.get('DISPLAY')
     if not display:
-        errors.append(
-            "未检测到图形显示环境 (DISPLAY 未设置)。\n"
-            "No graphical display detected.\n\n"
-            "请在桌面环境中运行此程序，而非 SSH/TTY。"
-        )
+        errors.append(get_message("err_no_display"))
     
     # 2. 检查 DBUS_SESSION_BUS_ADDRESS（gsettings 依赖，改为警告而非致命错误）
     dbus_addr = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
     if not dbus_addr:
         # 尝试从文件恢复（某些桌面环境可能未正确导出）
-        dbus_file = Path.home() / ".dbus" / "session-bus" / f"{os.environ.get('DISPLAY', ':0').replace(':', '')}-*"
         dbus_files = glob.glob(str(Path.home() / ".dbus" / "session-bus" / "*"))
         if not dbus_files:
             # 改为警告，程序仍可运行（Xray 代理可用，但系统代理设置可能不生效）
-            warnings.append(
-                "未检测到 DBus 会话总线 (DBUS_SESSION_BUS_ADDRESS 未设置)。\n"
-                "DBus session bus not detected.\n\n"
-                "系统代理设置可能无法自动生效。\n"
-                "VPN 仍可使用，请手动配置浏览器代理:\n"
-                "  HTTP: 127.0.0.1:1080\n"
-                "  SOCKS5: 127.0.0.1:10809"
-            )
+            warnings.append(get_message("warn_no_dbus"))
     
     # 3. 检查桌面环境类型（警告，非致命）
     desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
@@ -254,15 +243,8 @@ def check_environment():
     gnome_like = any(x in desktop or x in session for x in ['gnome', 'unity', 'ubuntu', 'budgie', 'cinnamon'])
     
     if not gnome_like:
-        warnings.append(
-            f"检测到桌面环境: {desktop or session or '未知'}\n"
-            f"Detected desktop: {desktop or session or 'Unknown'}\n\n"
-            "此程序使用 GNOME 系统代理设置 (gsettings)。\n"
-            "在非 GNOME 环境中，浏览器可能不会自动使用代理。\n"
-            "您可能需要手动配置浏览器代理为:\n"
-            "  HTTP: 127.0.0.1:1080\n"
-            "  SOCKS5: 127.0.0.1:10809"
-        )
+        desktop_name = desktop or session or 'Unknown'
+        warnings.append(get_message("warn_non_gnome").replace("{desktop}", desktop_name))
     
     # 显示错误（致命）
     if errors:
@@ -272,11 +254,11 @@ def check_environment():
             from tkinter import messagebox
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror("环境检查失败 / Environment Check Failed", "\n\n".join(errors))
+            messagebox.showerror(get_message("env_check_title"), "\n\n".join(errors))
             root.destroy()
         except:
             print("=" * 60, file=sys.stderr)
-            print("环境检查失败 / Environment Check Failed", file=sys.stderr)
+            print(get_message("env_check_title"), file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             for e in errors:
                 print(e, file=sys.stderr)
@@ -289,11 +271,11 @@ def check_environment():
             from tkinter import messagebox
             root = tk.Tk()
             root.withdraw()
-            messagebox.showwarning("环境提示 / Environment Notice", "\n\n".join(warnings))
+            messagebox.showwarning(get_message("env_notice_title"), "\n\n".join(warnings))
             root.destroy()
         except:
             for w in warnings:
-                print(f"[警告] {w}", file=sys.stderr)
+                print(f"[Warning] {w}", file=sys.stderr)
 
 # ================= 核心：系统代理设置 (Ubuntu 24.04 优化) =================
 
@@ -640,8 +622,8 @@ def show_main_window(uuid):
 if __name__ == "__main__":
     auto_demotion()  # 如果以 root 运行，自动降权到桌面用户
     check_single_instance()
+    load_language()  # 先加载语言包，以便环境检查能使用国际化文本
     check_environment()  # 验证运行环境（桌面会话、DBus）
-    load_language()
     
     login_window = tk.Tk()
     login_window.title(get_text("login_title"))
@@ -662,20 +644,35 @@ if __name__ == "__main__":
     # 绑定右键菜单
     create_context_menu(entry_uuid)
     
+    saved_uuid = ""
     if UUID_FILE.exists():
-        with open(UUID_FILE, "r") as f: entry_uuid.insert(0, f.read().strip())
+        with open(UUID_FILE, "r") as f: saved_uuid = f.read().strip()
+        entry_uuid.insert(0, saved_uuid)
+    
+    # 检查是否启用了自动登录
+    auto_login_enabled = AUTO_LOGIN_FILE.exists()
     
     def do_login():
         u = entry_uuid.get().strip()
         if len(u) > 5:
+            # 保存 UUID
+            with open(UUID_FILE, "w") as f: f.write(u)
+            # 根据复选框状态决定是否创建自动登录标记文件
             if chk_remember.get():
-                with open(UUID_FILE, "w") as f: f.write(u)
+                with open(AUTO_LOGIN_FILE, "w") as f: f.write("1")
+            else:
+                if AUTO_LOGIN_FILE.exists(): AUTO_LOGIN_FILE.unlink()
             login_window.destroy()
             show_main_window(u)
         else: messagebox.showerror("Error", get_message("invalid_code"))
 
-    chk_remember = tk.BooleanVar(value=True)
-    tk.Checkbutton(login_window, text=get_text("auto_login"), variable=chk_remember).pack()
-    tk.Button(login_window, text=get_text("login_button"), command=do_login).pack(pady=10)
-    
-    login_window.mainloop()
+    # 如果已启用自动登录且已有保存的 UUID，直接进入主界面
+    if auto_login_enabled and len(saved_uuid) > 5:
+        login_window.destroy()
+        show_main_window(saved_uuid)
+    else:
+        chk_remember = tk.BooleanVar(value=auto_login_enabled)  # 默认与之前的设置一致
+        tk.Checkbutton(login_window, text=get_text("auto_login"), variable=chk_remember).pack()
+        tk.Button(login_window, text=get_text("login_button"), command=do_login).pack(pady=10)
+        
+        login_window.mainloop()
