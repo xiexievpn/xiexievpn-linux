@@ -1,0 +1,32 @@
+# Python / PyInstaller
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Build artifacts
+build/
+dist/
+build_work/
+
+# Xray core binaries (downloaded by script)
+xray.zip
+xray
+geoip.dat
+geosite.dat
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
