@@ -135,7 +135,7 @@ fi
     os.execlp('su', 'su', '-', target_user, '-c', inner_cmd)
 
 # ================= 配置与常量 =================
-CURRENT_VERSION = "1.0.8" 
+CURRENT_VERSION = "1.0.9" 
 APP_NAME = "xiexievpn"
 
 # Linux 配置路径遵循 XDG 标准: ~/.config/xiexievpn
