@@ -424,7 +424,7 @@ def parse_and_write_config(url_string):
         sni = params.get('sni', [f"{domain}.rocketchats.xyz"])[0].replace("www.", "")
 
         outbounds = [
-            {"protocol": "vless", "settings": {"vnext": [{"address": f"{domain}.rocketchats.xyz", "port": 443, "users": [{"id": uuid, "encryption": "none", "flow": "xtls-rprx-vision"}]}]}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "fingerprint": "chrome", "serverName": sni, "publicKey": public_key, "shortId": short_id, "spiderX": ""}}, "tag": "proxy"},
+            {"protocol": "vless", "settings": {"vnext": [{"address": sni, "port": 443, "users": [{"id": uuid, "encryption": "none", "flow": "xtls-rprx-vision"}]}]}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "fingerprint": "chrome", "serverName": sni, "publicKey": public_key, "shortId": short_id, "spiderX": ""}}, "tag": "proxy"},
             {"protocol": "freedom", "tag": "direct"},
             {"protocol": "blackhole", "tag": "block"}
         ]
@@ -448,13 +448,18 @@ def parse_and_write_config(url_string):
 
         config_ready = True
         
-        # 如果是重连，重启服务
-        if proxy_state == 1:
-            manage_xray("start")
+        # 修复：将修改 UI 的操作打包，放回主线程执行，防止 Linux 界面冻结
+        def apply_ui_changes():
+            global pending_autostart
+            if proxy_state == 1:
+                manage_xray("start")
 
-        if pending_autostart:
-            pending_autostart = False
-            set_general_proxy()
+            if pending_autostart:
+                pending_autostart = False
+                set_general_proxy()
+                
+        if window:
+            window.after(0, apply_ui_changes)
             
     except Exception as e:
         print(f"Config Error: {e}")
@@ -467,20 +472,73 @@ def update_region_display(zone):
         if not reg_name or reg_name == f"region_{flag}":
              reg_name = zone
         
-        txt = f"{get_text('current_region')}: {reg_name}"
+        txt = f"{get_message('current_region')}: {reg_name}"
         region_label.config(text=txt)
 
+def do_adduser(uuid):
+    """触发服务端为新用户创建节点"""
+    no_proxy = {"http": None, "https": None}
+    try:
+        requests.post("https://vvv.xiexievpn.com/adduser", json={"code": uuid}, timeout=5, proxies=no_proxy)
+    except:
+        pass
+
+def poll_getuserinfo(uuid):
+    """轮询等待服务端分配节点完成"""
+    global current_region
+    no_proxy = {"http": None, "https": None}
+    try:
+        response = requests.post("https://vvv.xiexievpn.com/getuserinfo", json={"code": uuid}, proxies=no_proxy, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            v2rayurl = data.get("v2rayurl", "")
+            zone = data.get("zone", "")
+            if zone:
+                current_region = REGION_TO_FLAG.get(zone, zone)
+                if window:
+                    window.after(0, lambda: update_region_display(zone))
+            if v2rayurl:
+                parse_and_write_config(v2rayurl)
+                return
+    except:
+        pass
+
+    # 服务端尚未准备好，3 秒后继续轮询
+    if window and window.winfo_exists():
+        window.after(3000, lambda: poll_getuserinfo(uuid))
+
 def fetch_config_data(uuid):
+    """首次拉取配置，对齐 Windows 版的 adduser + 轮询机制"""
+    global current_region
     try:
         no_proxy = {"http": None, "https": None}
         res = requests.post("https://vvv.xiexievpn.com/getuserinfo", json={"code": uuid}, proxies=no_proxy, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            if data.get("zone"):
-                window.after(0, lambda: update_region_display(data["zone"]))
-            if data.get("v2rayurl"):
-                parse_and_write_config(data["v2rayurl"])
-    except: pass
+            v2rayurl = data.get("v2rayurl", "")
+            zone = data.get("zone", "")
+
+            if zone:
+                current_region = REGION_TO_FLAG.get(zone, zone)
+                if window:
+                    window.after(0, lambda: update_region_display(zone))
+
+            # 新用户：无配置也无区域 → 触发 adduser 并开始轮询
+            if not v2rayurl and not zone:
+                do_adduser(uuid)
+                if window:
+                    window.after(100, lambda: poll_getuserinfo(uuid))
+            # 有区域但无链接：VM 正在创建，等待轮询
+            elif not v2rayurl:
+                if window:
+                    window.after(100, lambda: poll_getuserinfo(uuid))
+            else:
+                parse_and_write_config(v2rayurl)
+    except Exception as e:
+        print(f"Network error: {e}")
+        # 网络异常也开启轮询，增加连通率
+        if window:
+            window.after(3000, lambda: poll_getuserinfo(uuid))
 
 # ================= 自愈机制 (Watchdog) =================
 
@@ -580,7 +638,7 @@ def show_main_window(uuid):
     global window, btn_general_proxy, btn_close_proxy, chk_autostart, region_label
     window = tk.Tk()
     window.title(get_text("app_title"))
-    window.geometry("300x380")
+    window.geometry("420x380")
     
     # 图标处理
     try:
@@ -606,7 +664,7 @@ def show_main_window(uuid):
     tk.Checkbutton(window, text=get_text("autostart"), variable=chk_autostart, command=toggle_autostart).pack(pady=10)
 
     # 区域显示
-    region_label = tk.Label(window, text=f"{get_text('current_region')}: ...", fg="gray")
+    region_label = tk.Label(window, text=f"{get_message('current_region')}: ...", fg="gray")
     region_label.pack(side="bottom", pady=15)
 
     threading.Thread(target=fetch_config_data, args=(uuid,), daemon=True).start()
@@ -655,16 +713,25 @@ if __name__ == "__main__":
     def do_login():
         u = entry_uuid.get().strip()
         if len(u) > 5:
-            # 保存 UUID
-            with open(UUID_FILE, "w") as f: f.write(u)
-            # 根据复选框状态决定是否创建自动登录标记文件
-            if chk_remember.get():
-                with open(AUTO_LOGIN_FILE, "w") as f: f.write("1")
-            else:
-                if AUTO_LOGIN_FILE.exists(): AUTO_LOGIN_FILE.unlink()
-            login_window.destroy()
-            show_main_window(u)
-        else: messagebox.showerror("Error", get_message("invalid_code"))
+            # 增加服务端校验，拒绝无效的随机码
+            no_proxy = {"http": None, "https": None}
+            try:
+                response = requests.post("https://vvv.xiexievpn.com/login", json={"code": u}, proxies=no_proxy, timeout=10)
+                if response.status_code == 200:
+                    with open(UUID_FILE, "w") as f: f.write(u)
+                    if chk_remember.get():
+                        with open(AUTO_LOGIN_FILE, "w") as f: f.write("1")
+                    else:
+                        if AUTO_LOGIN_FILE.exists(): AUTO_LOGIN_FILE.unlink()
+                    login_window.destroy()
+                    show_main_window(u)
+                else:
+                    msg = get_message("invalid_code") if response.status_code == 401 else get_message("expired") if response.status_code == 403 else get_message("server_error")
+                    messagebox.showerror("Error", msg)
+            except Exception as e:
+                messagebox.showerror("Error", f"{get_message('connection_error')}: {e}")
+        else:
+            messagebox.showerror("Error", get_message("invalid_code"))
 
     # 如果已启用自动登录且已有保存的 UUID，直接进入主界面
     if auto_login_enabled and len(saved_uuid) > 5:
