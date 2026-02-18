@@ -10,6 +10,9 @@ import fcntl
 import stat
 import shutil
 import glob
+import socket
+import concurrent.futures
+import base64
 from pathlib import Path
 
 # ================= 自动降权 (Root Auto-Demotion) =================
@@ -135,18 +138,21 @@ fi
     os.execlp('su', 'su', '-', target_user, '-c', inner_cmd)
 
 # ================= 配置与常量 =================
-CURRENT_VERSION = "1.0.9" 
+CURRENT_VERSION = "2.0.0" 
 APP_NAME = "xiexievpn"
+SUB_DOMAIN = "sub.xiexievpn.com"
 
 # Linux 配置路径遵循 XDG 标准: ~/.config/xiexievpn
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-CONFIG_FILE = CONFIG_DIR / "config.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"       # Xray (VLESS) 配置
+HY2_CONFIG_FILE = CONFIG_DIR / "hy2_config.json" # Hysteria2 配置
 UUID_FILE = CONFIG_DIR / "uuid.txt"
 AUTOSTART_FILE = CONFIG_DIR / "autostart_state.txt"
 AUTO_LOGIN_FILE = CONFIG_DIR / "auto_login.txt"  # 标记是否自动登录
 XRAY_BIN = CONFIG_DIR / "xray"
+HY2_BIN = CONFIG_DIR / "hysteria"
 
 # 区域代码映射
 REGION_TO_FLAG = {
@@ -161,11 +167,17 @@ proxy_state = 0
 pending_autostart = False
 current_region = None
 current_uuid = None
+current_protocol = None     # 当前使用的协议: "vless" / "hy2"
 window = None
 config_ready = False
-xray_process = None
+proxy_process = None        # 统一的代理进程引用 (Xray 或 Hysteria)
 lock_file_handle = None
 region_label = None
+protocol_label = None       # UI: 显示当前协议和延迟
+
+# UDP 阻断惩罚降级机制
+penalized_protocol = None
+penalty_until = 0
 
 # 尝试引入 Pillow 处理图标
 try:
@@ -198,6 +210,18 @@ def load_language():
             lang_data = languages.get('en', languages['en'])
     except:
         lang_data = {"app_title": "Xiexie VPN", "messages": {}}
+
+    # 确保协议相关文本存在（兼容未更新的 languages.json）
+    if "protocol_label" not in lang_data:
+        lang_data["protocol_label"] = "Protocol"
+    msgs = lang_data.get("messages", {})
+    if "speed_testing" not in msgs:
+        msgs["speed_testing"] = "Speed testing..."
+    if "speed_test_failed" not in msgs:
+        msgs["speed_test_failed"] = "Speed test failed"
+    if "degrading" not in msgs:
+        msgs["degrading"] = "Network blocked, smart fallback..."
+    lang_data["messages"] = msgs
 
 def get_text(key): return lang_data.get(key, key)
 def get_message(key): return lang_data.get("messages", {}).get(key, key)
@@ -310,7 +334,7 @@ def set_linux_proxy(enable, host="127.0.0.1", port="1080", socks_port="10809"):
     except Exception as e:
         print(f"Proxy Error: {e}")
 
-# ================= Xray 进程管理 =================
+# ================= 代理核心进程管理 (多协议) =================
 
 def ensure_xray_binary():
     """确保 xray 存在并有执行权限"""
@@ -332,31 +356,61 @@ def ensure_xray_binary():
             try: shutil.copy(dat_src, dat_dst)
             except: pass
 
-def manage_xray(action):
-    global xray_process
+def ensure_hy2_binary():
+    """确保 hysteria 二进制存在并有执行权限"""
+    src = resource_path("hysteria")
+    if not HY2_BIN.exists() or (os.path.exists(src) and os.stat(src).st_size != HY2_BIN.stat().st_size):
+        try: shutil.copy(src, HY2_BIN)
+        except: pass
+    
+    if HY2_BIN.exists():
+        st = os.stat(HY2_BIN)
+        os.chmod(HY2_BIN, st.st_mode | stat.S_IEXEC)
+
+def manage_proxy_process(action):
+    """统一的代理进程管理：根据 current_protocol 启动对应核心"""
+    global proxy_process
     if action == "start":
-        manage_xray("stop")
-        ensure_xray_binary()
+        manage_proxy_process("stop")
         try:
-            xray_process = subprocess.Popen(
-                [str(XRAY_BIN), "run", "-c", str(CONFIG_FILE)],
-                cwd=str(CONFIG_DIR),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            # 等待一小会儿确保没有立即崩溃
-            time.sleep(0.2)
-            if xray_process.poll() is not None:
+            if current_protocol == "hy2":
+                ensure_hy2_binary()
+                if not HY2_BIN.exists():
+                    return False
+                proxy_process = subprocess.Popen(
+                    [str(HY2_BIN), "-c", str(HY2_CONFIG_FILE)],
+                    cwd=str(CONFIG_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                ensure_xray_binary()
+                if not XRAY_BIN.exists():
+                    return False
+                proxy_process = subprocess.Popen(
+                    [str(XRAY_BIN), "run", "-c", str(CONFIG_FILE)],
+                    cwd=str(CONFIG_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            # 等待确保没有立即崩溃
+            time.sleep(0.3)
+            if proxy_process.poll() is not None:
                 return False
             return True
         except Exception as e:
-            messagebox.showerror("Error", f"Start Xray Failed: {e}")
+            print(f"Start proxy failed: {e}")
             return False
     elif action == "stop":
-        if xray_process:
-            xray_process.terminate()
-            xray_process = None
-        subprocess.run(["pkill", "-f", f"{XRAY_BIN} run -c"], stderr=subprocess.DEVNULL)
+        if proxy_process:
+            try: proxy_process.terminate()
+            except: pass
+            proxy_process = None
+        # 干净地杀掉所有残留进程
+        subprocess.run(["pkill", "-f", str(XRAY_BIN)], stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", str(HY2_BIN)], stderr=subprocess.DEVNULL)
+        # 关键：给内核时间回收端口，避免 "Address already in use"
+        time.sleep(0.3)
 
 # ================= 自动更新逻辑 =================
 
@@ -406,13 +460,80 @@ def perform_update():
     except Exception as e:
         messagebox.showerror("Update Error", str(e))
 
-# ================= 业务逻辑 =================
+# ================= 核心：多协议测速与配置生成引擎 =================
 
-def parse_and_write_config(url_string):
-    global config_ready, pending_autostart, proxy_state
+def test_tcp_ping(host, port=443):
+    """对目标 host:443 发起 TCP 握手测延迟（ms）。
+    统一测 443 端口评估物理链路，因为 HY2 是纯 UDP 协议，直接 TCP 测其端口会 Connection Refused。
+    """
     try:
-        if not url_string.startswith("vless://"): return
+        st = time.time()
+        with socket.create_connection((host, int(port)), timeout=1.5):
+            return (time.time() - st) * 1000
+    except Exception:
+        return float('inf')
+
+def safe_b64decode(data):
+    """安全的 Base64 解码，自动补齐 padding"""
+    data = data.strip()
+    data += "=" * ((4 - len(data) % 4) % 4)
+    return base64.b64decode(data).decode('utf-8', errors='ignore')
+
+def speed_test_nodes(links_text):
+    """解析链接文本，并行 TCP Ping 测速，返回最优节点"""
+    nodes = []
+    
+    # 兼容 Base64 编码的订阅内容
+    if "://" not in links_text:
+        try:
+            links_text = safe_b64decode(links_text)
+        except:
+            pass
+
+    for line in links_text.strip().split('\n'):
+        line = line.strip()
+        if line.startswith("vless://") or line.startswith("hysteria2://") or line.startswith("hy2://"):
+            try:
+                protocol = "vless" if line.startswith("vless") else "hy2"
+                main_part = line.split("://")[1]
+                host_port = main_part.split("@")[1].split("?")[0].split("/")[0]
+                host = host_port.split(":")[0]
+                # 统一对 443 端口测速（评估物理链路延迟）
+                nodes.append({"protocol": protocol, "url": line, "host": host, "port": 443})
+            except:
+                pass
+            
+    if not nodes:
+        return None
+
+    def test_node(node):
+        node["ping"] = test_tcp_ping(node["host"], node["port"])
+        # UDP 阻断惩罚：如果协议被 Watchdog 判定过阻断，人为增加 5000ms 延迟迫使其降级
+        if penalized_protocol == node["protocol"] and time.time() < penalty_until:
+            if node["ping"] != float('inf'):
+                node["ping"] += 5000
+        # HY2 延迟补偿：HY2 抗拥塞更强，减 50ms 增加选中概率
+        if node["protocol"] == "hy2" and node["ping"] != float('inf'):
+            node["ping"] = max(0, node["ping"] - 50)
+        return node
         
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(nodes)))) as executor:
+        results = list(executor.map(test_node, nodes))
+        
+    valid = [r for r in results if r["ping"] != float('inf')]
+    if not valid:
+        # 兜底：如果 TCP 全面阻断，盲选第一个节点
+        nodes[0]["ping"] = float('inf')
+        return nodes[0]
+        
+    valid.sort(key=lambda x: x["ping"])
+    return valid[0]
+
+def write_vless_config(url_string):
+    """解析 vless:// URL 并生成 xray config.json"""
+    try:
+        if not url_string.startswith("vless://"):
+            return False
         uuid = url_string.split("@")[0].split("://")[1]
         main_part = url_string.split("@")[1]
         domain_port_part = main_part.split("?")[0]
@@ -428,41 +549,118 @@ def parse_and_write_config(url_string):
             {"protocol": "freedom", "tag": "direct"},
             {"protocol": "blackhole", "tag": "block"}
         ]
-        
         rules = [
             {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
             {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
             {"type": "field", "domain": ["geosite:geolocation-!cn"], "outboundTag": "proxy"},
             {"type": "field", "ip": ["geoip:cn", "geoip:private"], "outboundTag": "direct"}
         ]
-
         config_data = {
             "log": {"loglevel": "none"},
             "routing": {"domainStrategy": "IPIfNonMatch", "rules": rules},
-            "inbounds": [{"listen": "127.0.0.1", "port": 10809, "protocol": "socks"}, {"listen": "127.0.0.1", "port": 1080, "protocol": "http"}],
+            "inbounds": [
+                {"listen": "127.0.0.1", "port": 10809, "protocol": "socks"},
+                {"listen": "127.0.0.1", "port": 1080, "protocol": "http"}
+            ],
             "outbounds": outbounds
         }
-        
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=4)
-
-        config_ready = True
-        
-        # 修复：将修改 UI 的操作打包，放回主线程执行，防止 Linux 界面冻结
-        def apply_ui_changes():
-            global pending_autostart
-            if proxy_state == 1:
-                manage_xray("start")
-
-            if pending_autostart:
-                pending_autostart = False
-                set_general_proxy()
-                
-        if window:
-            window.after(0, apply_ui_changes)
-            
+        return True
     except Exception as e:
-        print(f"Config Error: {e}")
+        print(f"VLESS Config Error: {e}")
+        return False
+
+def write_hy2_config(url_string):
+    """解析 hysteria2:// URL 并生成 hy2_config.json（纯 JSON，0 额外依赖）。
+    端口严格对齐 SOCKS5=10809, HTTP=1080，与系统代理设置一致。
+    """
+    try:
+        main_part = url_string.split("://")[1]
+        uuid = main_part.split("@")[0]
+        host_port = main_part.split("@")[1].split("?")[0].split("/")[0]
+        query_part = main_part.split("?")[1].split("#")[0] if "?" in main_part else ""
+        sni = urllib.parse.parse_qs(query_part).get('sni', [host_port.split(':')[0]])[0]
+
+        config_data = {
+            "server": host_port,
+            "auth": uuid,
+            "tls": {
+                "sni": sni,
+                "insecure": False
+            },
+            "socks5": {
+                "listen": "127.0.0.1:10809"
+            },
+            "http": {
+                "listen": "127.0.0.1:1080"
+            }
+        }
+        with open(HY2_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4)
+        return True
+    except Exception as e:
+        print(f"HY2 Config Error: {e}")
+        return False
+
+def parse_and_write_config_async(links_text, callback=None):
+    """异步测速 + 写入最优节点配置（线程安全，所有 UI 操作通过 window.after）"""
+    global current_protocol, config_ready, pending_autostart
+    
+    if protocol_label and window:
+        window.after(0, lambda: protocol_label.config(text=get_message("speed_testing"), fg="orange"))
+        
+    def task():
+        global current_protocol, config_ready, pending_autostart
+        best_node = speed_test_nodes(links_text)
+        if not best_node:
+            if protocol_label and window:
+                window.after(0, lambda: protocol_label.config(text=get_message("speed_test_failed"), fg="red"))
+            if callback and window:
+                window.after(0, lambda: callback(False))
+            return
+            
+        if best_node["protocol"] == "vless":
+            success = write_vless_config(best_node["url"])
+        else:
+            success = write_hy2_config(best_node["url"])
+            
+        if success:
+            current_protocol = best_node["protocol"]
+            config_ready = True
+            
+            def update_ui():
+                global pending_autostart
+                if protocol_label:
+                    p_text = "VLESS ⚡" if current_protocol == "vless" else "HY2 🚀"
+                    ping_text = f"{int(best_node['ping'])}ms" if best_node['ping'] != float('inf') else "Blind"
+                    # 显示降级状态
+                    if penalized_protocol and time.time() < penalty_until and current_protocol != penalized_protocol:
+                        p_text += " (↓ fallback)"
+                    protocol_label.config(text=f"{get_text('protocol_label')}: {p_text} ({ping_text})", fg="green")
+                
+                if pending_autostart:
+                    pending_autostart = False
+                    set_general_proxy()
+                elif proxy_state == 1:
+                    # 代理开启状态下静默重载进程
+                    manage_proxy_process("stop")
+                    manage_proxy_process("start")
+                elif 'btn_general_proxy' in globals() and btn_general_proxy and proxy_state == 0:
+                    btn_general_proxy.config(state="normal")
+                
+                if callback:
+                    callback(True)
+                    
+            if window:
+                window.after(0, update_ui)
+        else:
+            if callback and window:
+                window.after(0, lambda: callback(False))
+                
+    threading.Thread(target=task, daemon=True).start()
+
+# ================= 业务逻辑 =================
 
 def update_region_display(zone):
     if window and region_label:
@@ -483,67 +681,75 @@ def do_adduser(uuid):
     except:
         pass
 
-def poll_getuserinfo(uuid):
-    """轮询等待服务端分配节点完成"""
+def fetch_subscription(uuid):
+    """双通道配置拉取：优先 Worker 订阅，回退 /getuserinfo"""
     global current_region
     no_proxy = {"http": None, "https": None}
-    try:
-        response = requests.post("https://vvv.xiexievpn.com/getuserinfo", json={"code": uuid}, proxies=no_proxy, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            v2rayurl = data.get("v2rayurl", "")
-            zone = data.get("zone", "")
-            if zone:
-                current_region = REGION_TO_FLAG.get(zone, zone)
-                if window:
-                    window.after(0, lambda: update_region_display(zone))
-            if v2rayurl:
-                parse_and_write_config(v2rayurl)
-                return
-    except:
-        pass
-
-    # 服务端尚未准备好，3 秒后继续轮询
-    if window and window.winfo_exists():
-        window.after(3000, lambda: poll_getuserinfo(uuid))
-
-def fetch_config_data(uuid):
-    """首次拉取配置，对齐 Windows 版的 adduser + 轮询机制"""
-    global current_region
-    try:
-        no_proxy = {"http": None, "https": None}
-        res = requests.post("https://vvv.xiexievpn.com/getuserinfo", json={"code": uuid}, proxies=no_proxy, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            v2rayurl = data.get("v2rayurl", "")
-            zone = data.get("zone", "")
-
-            if zone:
-                current_region = REGION_TO_FLAG.get(zone, zone)
-                if window:
-                    window.after(0, lambda: update_region_display(zone))
-
-            # 新用户：无配置也无区域 → 触发 adduser 并开始轮询
-            if not v2rayurl and not zone:
-                do_adduser(uuid)
-                if window:
-                    window.after(100, lambda: poll_getuserinfo(uuid))
-            # 有区域但无链接：VM 正在创建，等待轮询
-            elif not v2rayurl:
-                if window:
-                    window.after(100, lambda: poll_getuserinfo(uuid))
-            else:
-                parse_and_write_config(v2rayurl)
-    except Exception as e:
-        print(f"Network error: {e}")
-        # 网络异常也开启轮询，增加连通率
-        if window:
-            window.after(3000, lambda: poll_getuserinfo(uuid))
+    
+    def task():
+        global current_region
+        links_text = ""
+        
+        # 通道 1：Cloudflare Worker 订阅
+        try:
+            resp = requests.get(f"https://{SUB_DOMAIN}/sub/{uuid}?t={int(time.time())}", timeout=5, proxies=no_proxy)
+            if resp.status_code == 200:
+                links_text = resp.text.strip()
+        except:
+            pass
+        
+        # 通道 2：原生 /getuserinfo 兜底
+        try:
+            response = requests.post("https://vvv.xiexievpn.com/getuserinfo",
+                                     json={"code": uuid}, proxies=no_proxy, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                zone = data.get("zone", "")
+                v2rayurl = data.get("v2rayurl", "")
+                
+                if zone:
+                    current_region = REGION_TO_FLAG.get(zone, zone)
+                    if window:
+                        window.after(0, lambda: update_region_display(zone))
+                
+                if not links_text and v2rayurl:
+                    links_text = v2rayurl
+                
+                # 新用户：无配置也无区域，需先 adduser
+                if not v2rayurl and not zone:
+                    try:
+                        requests.post("https://vvv.xiexievpn.com/adduser",
+                                      json={"code": uuid}, timeout=2, proxies=no_proxy)
+                    except:
+                        pass
+                    if window:
+                        window.after(3000, lambda: fetch_subscription(uuid))
+                    return
+                
+                # 有区域但无链接：等待 VM 创建完成
+                if not v2rayurl and zone:
+                    if window:
+                        window.after(3000, lambda: fetch_subscription(uuid))
+                    return
+        except:
+            pass
+            
+        if links_text:
+            parse_and_write_config_async(links_text)
+        else:
+            # 都失败了，继续轮询
+            if window:
+                window.after(3000, lambda: fetch_subscription(uuid))
+                
+    threading.Thread(target=task, daemon=True).start()
 
 # ================= 自愈机制 (Watchdog) =================
 
 def connection_watchdog(uuid):
-    """检测连接，如果代理开启但无法上网，尝试重连"""
+    """检测连接。如果代理开启但无法上网，尝试重连。
+    增加 UDP 阻断检测：如果使用 HY2 连续失败，设定惩罚期迫使下次测速降级到 VLESS。
+    """
+    global penalized_protocol, penalty_until
     fail_count = 0
     while True:
         time.sleep(15)
@@ -561,9 +767,16 @@ def connection_watchdog(uuid):
                 # 2. 检查本地网络
                 try:
                     requests.get("https://www.baidu.com", proxies={"http": None, "https": None}, timeout=5)
-                    # 本地有网，代理挂了 -> 重连
-                    print("Watchdog: Refreshing config...")
-                    fetch_config_data(uuid)
+                    # 本地有网，代理挂了
+                    print("Watchdog: Proxy down, refreshing config...")
+                    
+                    # 如果当前用的是 HY2 且连续失败，大概率 UDP 被阻断
+                    if current_protocol == "hy2":
+                        penalized_protocol = "hy2"
+                        penalty_until = time.time() + 300  # 惩罚 5 分钟
+                        print("Watchdog: HY2 penalized for 5 min (UDP likely blocked)")
+                    
+                    fetch_subscription(uuid)
                     fail_count = 0
                 except: pass
 
@@ -571,11 +784,18 @@ def connection_watchdog(uuid):
 
 def set_general_proxy():
     global proxy_state
-    if not CONFIG_FILE.exists():
+    # 检查对应协议的配置文件是否存在
+    config_exists = False
+    if current_protocol == "hy2":
+        config_exists = HY2_CONFIG_FILE.exists()
+    else:
+        config_exists = CONFIG_FILE.exists()
+    
+    if not config_exists:
         messagebox.showinfo(get_text("app_title"), get_message("config_preparing"))
         return
     
-    if manage_xray("start"):
+    if manage_proxy_process("start"):
         set_linux_proxy(True)
         messagebox.showinfo("Information", get_message("vpn_setup_success"))
         btn_general_proxy.config(state="disabled")
@@ -583,12 +803,12 @@ def set_general_proxy():
         proxy_state = 1
         toggle_autostart()
     else:
-        messagebox.showerror("Error", "Failed to start Xray core.")
+        messagebox.showerror("Error", "Failed to start proxy core.")
 
 def close_proxy():
     global proxy_state
     set_linux_proxy(False)
-    manage_xray("stop")
+    manage_proxy_process("stop")
     messagebox.showinfo("Information", get_message("vpn_closed"))
     btn_close_proxy.config(state="disabled")
     btn_general_proxy.config(state="normal")
@@ -610,7 +830,7 @@ def toggle_autostart():
 def on_closing():
     if proxy_state == 1:
         set_linux_proxy(False)
-        manage_xray("stop")
+        manage_proxy_process("stop")
     window.destroy()
     sys.exit(0)
 
@@ -635,10 +855,10 @@ def create_context_menu(widget):
 # ================= 窗口逻辑 =================
 
 def show_main_window(uuid):
-    global window, btn_general_proxy, btn_close_proxy, chk_autostart, region_label
+    global window, btn_general_proxy, btn_close_proxy, chk_autostart, region_label, protocol_label
     window = tk.Tk()
     window.title(get_text("app_title"))
-    window.geometry("420x380")
+    window.geometry("420x420")
     
     # 图标处理
     try:
@@ -663,11 +883,16 @@ def show_main_window(uuid):
         with open(AUTOSTART_FILE, "r") as f: chk_autostart.set(f.read().strip() == "1")
     tk.Checkbutton(window, text=get_text("autostart"), variable=chk_autostart, command=toggle_autostart).pack(pady=10)
 
+    # 协议状态显示
+    protocol_label = tk.Label(window, text=get_message("speed_testing"), fg="orange")
+    protocol_label.pack(pady=5)
+
     # 区域显示
     region_label = tk.Label(window, text=f"{get_message('current_region')}: ...", fg="gray")
     region_label.pack(side="bottom", pady=15)
 
-    threading.Thread(target=fetch_config_data, args=(uuid,), daemon=True).start()
+    # 使用双通道订阅拉取（Worker + getuserinfo）
+    fetch_subscription(uuid)
     threading.Thread(target=update_checker, daemon=True).start()
     threading.Thread(target=connection_watchdog, args=(uuid,), daemon=True).start()
 
