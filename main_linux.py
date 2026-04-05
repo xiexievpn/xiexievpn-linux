@@ -13,7 +13,11 @@ import glob
 import socket
 import concurrent.futures
 import base64
+import random
+import tempfile
 from pathlib import Path
+import socks                   # pysocks：HY2 测速 SOCKS5 代理依赖
+import urllib3.contrib.socks    # requests SOCKS 代理底层支持
 
 # ================= 自动降权 (Root Auto-Demotion) =================
 
@@ -178,6 +182,7 @@ protocol_label = None       # UI: 显示当前协议和延迟
 # UDP 阻断惩罚降级机制
 penalized_protocol = None
 penalty_until = 0
+current_node_url = None  # 防死循环：记录当前运行的节点 URL
 
 # 尝试引入 Pillow 处理图标
 try:
@@ -473,11 +478,87 @@ def test_tcp_ping(host, port=443):
     except Exception:
         return float('inf')
 
+def test_hy2_url_test(node):
+    """启动临时 Hysteria 进程，通过 SOCKS5 代理做 URL Test 测真实延迟"""
+    temp_port = random.randint(30000, 39999)
+    config = {
+        "server": f"{node['host']}:{node['port']}",
+        "auth": node.get('uuid', ''),
+        "tls": {"sni": node.get('sni', node['host']), "insecure": False},
+        "socks5": {"listen": f"127.0.0.1:{temp_port}"}
+    }
+    config_path = os.path.join(tempfile.gettempdir(), f"hy2_test_{temp_port}.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f)
+
+    proc = None
+    try:
+        ensure_hy2_binary()
+        if not HY2_BIN.exists():
+            return float('inf')
+        proc = subprocess.Popen(
+            [str(HY2_BIN), "client", "-c", config_path],
+            cwd=str(CONFIG_DIR),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)
+        if proc.poll() is not None:
+            return float('inf')
+
+        proxies = {'http': f'socks5h://127.0.0.1:{temp_port}',
+                   'https': f'socks5h://127.0.0.1:{temp_port}'}
+        st = time.time()
+        resp = requests.get("http://cp.cloudflare.com/generate_204",
+                           proxies=proxies, timeout=5)
+        if resp.status_code == 204:
+            return (time.time() - st) * 1000
+        return float('inf')
+    except Exception:
+        return float('inf')
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        try:
+            os.remove(config_path)
+        except Exception:
+            pass
+
 def safe_b64decode(data):
     """安全的 Base64 解码，自动补齐 padding"""
     data = data.strip()
     data += "=" * ((4 - len(data) % 4) % 4)
     return base64.b64decode(data).decode('utf-8', errors='ignore')
+
+def extract_region_from_link(link):
+    """从节点 URL 的 #fragment 中提取区域标记（如 us/si 或 aws region）。"""
+    try:
+        if "#" not in link:
+            return None
+
+        frag = urllib.parse.unquote(link.split("#", 1)[1]).strip().lower()
+        if not frag:
+            return None
+
+        if frag.endswith("-hy2"):
+            frag = frag[:-4]
+
+        if frag in REGION_TO_FLAG.values():
+            return frag
+
+        if frag in REGION_TO_FLAG:
+            return REGION_TO_FLAG[frag]
+
+        for aws_region, flag_code in REGION_TO_FLAG.items():
+            if frag.startswith(aws_region):
+                return flag_code
+
+        return None
+    except Exception:
+        return None
 
 def speed_test_nodes(links_text):
     """解析链接文本，并行 TCP Ping 测速，返回最优节点"""
@@ -497,9 +578,16 @@ def speed_test_nodes(links_text):
                 protocol = "vless" if line.startswith("vless") else "hy2"
                 main_part = line.split("://")[1]
                 host_port = main_part.split("@")[1].split("?")[0].split("/")[0]
-                host = host_port.split(":")[0]
-                # 统一对 443 端口测速（评估物理链路延迟）
-                nodes.append({"protocol": protocol, "url": line, "host": host, "port": 443})
+                host_parts = host_port.split(":")
+                host = host_parts[0]
+                port = int(host_parts[1]) if len(host_parts) > 1 else 443
+                node_info = {"protocol": protocol, "url": line, "host": host, "port": port}
+                # HY2 节点：额外解析 uuid 和 sni 供 URL Test 临时配置使用
+                if protocol == "hy2":
+                    node_info["uuid"] = main_part.split("@")[0]
+                    query_part = main_part.split("?")[1].split("#")[0] if "?" in main_part else ""
+                    node_info["sni"] = urllib.parse.parse_qs(query_part).get('sni', [host])[0]
+                nodes.append(node_info)
             except:
                 pass
             
@@ -507,14 +595,16 @@ def speed_test_nodes(links_text):
         return None
 
     def test_node(node):
-        node["ping"] = test_tcp_ping(node["host"], node["port"])
+        if node["protocol"] == "hy2":
+            node["ping"] = test_hy2_url_test(node)  # HY2 用真代理 URL Test
+        else:
+            tcp_ping = test_tcp_ping(node["host"], 443)
+            # 补偿：TCP 是 1 个 RTT，完整 HTTPS 代理请求约需 3 个 RTT + 100ms 处理损耗
+            node["ping"] = tcp_ping * 3 + 100 if tcp_ping != float('inf') else float('inf')
         # UDP 阻断惩罚：如果协议被 Watchdog 判定过阻断，人为增加 5000ms 延迟迫使其降级
         if penalized_protocol == node["protocol"] and time.time() < penalty_until:
             if node["ping"] != float('inf'):
                 node["ping"] += 5000
-        # HY2 延迟补偿：HY2 抗拥塞更强，减 50ms 增加选中概率
-        if node["protocol"] == "hy2" and node["ping"] != float('inf'):
-            node["ping"] = max(0, node["ping"] - 50)
         return node
         
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(nodes)))) as executor:
@@ -611,13 +701,24 @@ def parse_and_write_config_async(links_text, callback=None):
         window.after(0, lambda: protocol_label.config(text=get_message("speed_testing"), fg="orange"))
         
     def task():
-        global current_protocol, config_ready, pending_autostart
+        global current_protocol, config_ready, pending_autostart, current_node_url, current_region
         best_node = speed_test_nodes(links_text)
         if not best_node:
             if protocol_label and window:
                 window.after(0, lambda: protocol_label.config(text=get_message("speed_test_failed"), fg="red"))
             if callback and window:
                 window.after(0, lambda: callback(False))
+            return
+
+        # 防死循环：如果最优节点和当前运行的一模一样，不重复暴力重启内核
+        if best_node["url"] == current_node_url and config_ready:
+            selected_region = extract_region_from_link(best_node["url"])
+            if selected_region:
+                current_region = selected_region
+                if window:
+                    window.after(0, lambda r=selected_region: update_region_display(r))
+            if callback and window:
+                window.after(0, lambda: callback(True))
             return
             
         if best_node["protocol"] == "vless":
@@ -628,6 +729,10 @@ def parse_and_write_config_async(links_text, callback=None):
         if success:
             current_protocol = best_node["protocol"]
             config_ready = True
+            current_node_url = best_node["url"]  # 记录当前节点
+            selected_region = extract_region_from_link(best_node["url"])
+            if selected_region:
+                current_region = selected_region
             
             def update_ui():
                 global pending_autostart
@@ -638,6 +743,9 @@ def parse_and_write_config_async(links_text, callback=None):
                     if penalized_protocol and time.time() < penalty_until and current_protocol != penalized_protocol:
                         p_text += " (↓ fallback)"
                     protocol_label.config(text=f"{get_text('protocol_label')}: {p_text} ({ping_text})", fg="green")
+
+                if current_region:
+                    update_region_display(current_region)
                 
                 if pending_autostart:
                     pending_autostart = False
@@ -681,14 +789,16 @@ def do_adduser(uuid):
     except:
         pass
 
-def fetch_subscription(uuid):
+def fetch_subscription(uuid, from_watchdog=False):
     """双通道配置拉取：优先 Worker 订阅，回退 /getuserinfo"""
     global current_region
     no_proxy = {"http": None, "https": None}
     
     def task():
-        global current_region
+        global current_region, current_protocol, penalized_protocol, penalty_until
         links_text = ""
+        prev_region = current_region
+        region_changed = False
         
         # 通道 1：Cloudflare Worker 订阅
         try:
@@ -708,9 +818,12 @@ def fetch_subscription(uuid):
                 v2rayurl = data.get("v2rayurl", "")
                 
                 if zone:
-                    current_region = REGION_TO_FLAG.get(zone, zone)
+                    mapped_region = REGION_TO_FLAG.get(zone, zone)
+                    if prev_region and prev_region != mapped_region:
+                        region_changed = True
+                    current_region = mapped_region
                     if window:
-                        window.after(0, lambda: update_region_display(zone))
+                        window.after(0, lambda r=mapped_region: update_region_display(r))
                 
                 if not links_text and v2rayurl:
                     links_text = v2rayurl
@@ -735,6 +848,15 @@ def fetch_subscription(uuid):
             pass
             
         if links_text:
+            if from_watchdog:
+                if region_changed:
+                    penalized_protocol = None
+                    penalty_until = 0
+                else:
+                    penalized_protocol = current_protocol
+                    penalty_until = time.time() + 300  # 惩罚 5 分钟
+                    if protocol_label and window:
+                        window.after(0, lambda: protocol_label.config(text=get_message("degrading"), fg="red"))
             parse_and_write_config_async(links_text)
         else:
             # 都失败了，继续轮询
@@ -746,39 +868,36 @@ def fetch_subscription(uuid):
 # ================= 自愈机制 (Watchdog) =================
 
 def connection_watchdog(uuid):
-    """检测连接。如果代理开启但无法上网，尝试重连。
-    增加 UDP 阻断检测：如果使用 HY2 连续失败，设定惩罚期迫使下次测速降级到 VLESS。
-    """
+    """带协议惩罚降级的连接看门狗（极速复查版）"""
     global penalized_protocol, penalty_until
-    fail_count = 0
     while True:
-        time.sleep(15)
+        time.sleep(10)
         if proxy_state == 1:
             # 1. 检查代理是否通
             try:
                 proxies = {'http': 'http://127.0.0.1:1080', 'https': 'http://127.0.0.1:1080'}
-                if requests.get("http://www.google.com/generate_204", proxies=proxies, timeout=5).status_code == 204:
-                    fail_count = 0
+                if requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=5).status_code == 204:
                     continue
             except: pass
             
-            fail_count += 1
-            if fail_count >= 2:
-                # 2. 检查本地网络
-                try:
-                    requests.get("https://www.baidu.com", proxies={"http": None, "https": None}, timeout=5)
-                    # 本地有网，代理挂了
-                    print("Watchdog: Proxy down, refreshing config...")
-                    
-                    # 如果当前用的是 HY2 且连续失败，大概率 UDP 被阻断
-                    if current_protocol == "hy2":
-                        penalized_protocol = "hy2"
-                        penalty_until = time.time() + 300  # 惩罚 5 分钟
-                        print("Watchdog: HY2 penalized for 5 min (UDP likely blocked)")
-                    
-                    fetch_subscription(uuid)
-                    fail_count = 0
-                except: pass
+            # 不再死等累计 fail_count，立即 1.5 秒快速复查
+            time.sleep(1.5)
+            try:
+                proxies = {'http': 'http://127.0.0.1:1080', 'https': 'http://127.0.0.1:1080'}
+                if requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=5).status_code == 204:
+                    continue
+            except: pass
+            
+            # 确认断线，检查本地网络
+            try:
+                requests.get("https://www.baidu.com", proxies={"http": None, "https": None}, timeout=5)
+                # 本地有网，代理挂了
+                print("Watchdog: Proxy down, refreshing config...")
+
+                # 由 fetch_subscription 根据“是否换区”决定是否惩罚当前协议
+                fetch_subscription(uuid, from_watchdog=True)
+                time.sleep(15)  # 正在降级换线，暂停监控 15 秒
+            except: pass
 
 # ================= UI 功能 =================
 
